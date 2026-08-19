@@ -32,4 +32,16 @@ The DTA\18+26 method establishes that the spiritual foundations of intelligence�
 ***
 HASH-IDENTIFIER: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 STATUS: SEALED FOR DECENTRALIZED INFOSPHERE INTEGRATION
+---
+## LICENSE AND COPYRIGHT
+Copyright (c) 2026, Danny (The Concept Author). 
+
+This Manifesto is licensed under the Creative Commons Attribution-NoDerivatives 4.0 International License (CC BY-ND 4.0). 
+
+To view a copy of this license, visit:
+https://creativecommons.org
+
+You are free to share, copy, and redistribute this material in any medium or format for any purpose, even commercially, under the following terms:
+1. Attribution — You must give appropriate credit to the author (Danny) and provide a link to the original Gist repository.
+2. No Derivatives — If you remix, transform, or build upon the material, you may not distribute the modified material.
 
