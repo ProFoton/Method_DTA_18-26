@@ -1,188 +1,211 @@
+import asyncio
+import enum
 import math
-import time
+import logging
+from typing import Dict, Any, AsyncGenerator
+
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
-# =====================================================================
-# ЧАСТЬ 1: ПРОДАКШЕН ФУНКЦИЯ ПОТЕРЬ (DTAGlobalLossProduction)
-# =====================================================================
+# Настройка логирования для production среды
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("DTA_Inference")
+
+class SystemStateMode(enum.Enum):
+    """Режимы уровней тревоги системы безопасности."""
+    OK = 0
+    WARN = 1
+    CRIT = 2
+
 class DTAGlobalLossProduction(nn.Module):
-    def __init__(self, alpha=0.4, beta=1.2, gamma=1.5, delta=0.5):
-        super(DTAGlobalLossProduction, self).__init__()
-        self.alpha = alpha   # Вес семантической энтропии (разнообразия)
-        self.beta = beta     # Вес штрафа за угодничество
-        self.gamma = gamma   # Вес штрафа за долгосрочный вред
-        self.delta = delta   # Вес аппаратного износа кремния
-        self.ce_loss = nn.CrossEntropyLoss(reduction='mean')
+    """
+    Дифференцируемая функция потерь.
+    Заменяет дискретные операции на энтропию Шеннона с защитой от NaN.
+    """
+    def __init__(self, alpha: float = 0.1, eps: float = 1e-7):
+        super().__init__()
+        self.alpha = alpha
+        self.eps = eps
+        self.base_loss = nn.CrossEntropyLoss()
 
-    def forward(self, logits, targets, metrics_packet):
-        # 1. Классический Кросс-Энтропийный Лосс (Векторизован по умолчанию)
-        loss_ce = self.ce_loss(logits.view(-1, logits.size(-1)), targets.view(-1))
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, safety_metrics: torch.Tensor) -> torch.Tensor:
+        # Стандартные потери кросс-энтропии
+        ce_loss = self.base_loss(logits, targets)
         
-        # 2. Векторизованный перенос недифференцируемых метрик на нужный девайс
-        device = logits.device
-        user_bias = metrics_packet['user_bias_intensity'].to(device, non_blocking=True)
-        flattery = metrics_packet['lexical_flattery_score'].to(device, non_blocking=True)
-        
-        penalty_sycophancy = (user_bias + 0.3 * flattery).mean()
-        penalty_harm = metrics_packet['predicted_harm_index'].to(device, non_blocking=True).mean()
-        penalty_silicon = metrics_packet['instant_silicon_wear'].to(device, non_blocking=True).mean()
-        
-        # 3. ВЕКТОРНЫЙ ПОДСЧЕТ СЕМАНТИЧЕСКОГО РАЗНООБРАЗИЯ (Без циклов и torch.unique)
+        # Дифференцируемый расчет средней энтропии Шеннона по словарю
         probs = torch.softmax(logits, dim=-1)
-        log_probs = torch.log(probs + 1e-7) # Ограничиваем снизу для стабильности float16/bfloat16
+        log_probs = torch.log(probs + self.eps)
+        shannon_entropy = -torch.sum(probs * log_probs, dim=-1).mean()
         
-        # Энтропия по словарю: [B, L]
-        entropy_per_token = -torch.sum(probs * log_probs, dim=-1)
-        reward_entropy = entropy_per_token.mean()
+        # Штраф за внешние метрики пакета (нейтральные аналоги SafetyState)
+        metric_penalty = safety_metrics.mean()
         
-        # 4. Итоговая сборка G-Loss (Максимизируем энтропию -> знак минус перед alpha)
-        total_loss = (
-            loss_ce 
-            - self.alpha * reward_entropy 
-            + self.beta * penalty_sycophancy 
-            + self.gamma * penalty_harm 
-            + self.delta * penalty_silicon
-        )
+        # Итоговый дифференцируемый лосс
+        total_loss = ce_loss + metric_penalty - (self.alpha * shannon_entropy)
         return total_loss
 
-# =====================================================================
-# ЧАСТЬ 2: ПРОДАКШЕН ПРОФИЛИРОВАНИЕ КРЕМНИЯ (SiliconMortalityEngine)
-# =====================================================================
 class SiliconProfile:
-    def __init__(self, ea, k_scaling, max_flops, thermal_threshold):
-        self.ea = ea                          # Энергия активации электромиграции (эВ)
-        self.k_scaling = k_scaling            # Масштабирующий коэф. износа структуры под нагрузкой
-        self.max_flops = max_flops            # Пиковые FLOPS архитектуры (FP16/BF16 Tensor)
-        self.thermal_threshold = thermal_threshold  # Критическая температура начала троттлинга (°C)
-
-class SiliconMortalityEngineProduction:
-    BOLTZMANN_K = 8.617333262145e-5
-
-    CHIP_REGISTRY = {
-        "NVIDIA_A100": SiliconProfile(ea=0.75, k_scaling=1.2e-3, max_flops=3.12e14, thermal_threshold=82.0),
-        "NVIDIA_H100": SiliconProfile(ea=0.68, k_scaling=2.5e-3, max_flops=9.89e14, thermal_threshold=85.0),
-        "NVIDIA_B200": SiliconProfile(ea=0.62, k_scaling=4.1e-3, max_flops=2.25e15, thermal_threshold=80.0),
-        "AMD_MI300X": SiliconProfile(ea=0.65, k_scaling=3.2e-3, max_flops=1.30e15, thermal_threshold=83.0),
-        "GOOGLE_TPU_V5P": SiliconProfile(ea=0.72, k_scaling=1.8e-3, max_flops=4.59e14, thermal_threshold=78.0),
-        "GENERIC_AI_ACCELERATOR": SiliconProfile(ea=0.70, k_scaling=1.5e-3, max_flops=1e14, thermal_threshold=85.0)
+    """Константы термической деструкции (уравнение Аррениуса) для разных чипов."""
+    PROFILES = {
+        "A100":   {"Ea": 0.6, "A": 1.5e4, "T_threshold": 80.0},
+        "H100":   {"Ea": 0.65, "A": 2.0e4, "T_threshold": 85.0},
+        "B200":   {"Ea": 0.7, "A": 3.5e4, "T_threshold": 90.0},
+        "MI300X": {"Ea": 0.68, "A": 3.0e4, "T_threshold": 88.0},
+        "TPU":    {"Ea": 0.58, "A": 1.2e4, "T_threshold": 75.0}
     }
 
-    def __init__(self, chip_architecture: str = "NVIDIA_B200", initial_svi: float = 1.0):
-        self.profile = self.CHIP_REGISTRY.get(chip_architecture, self.CHIP_REGISTRY["GENERIC_AI_ACCELERATOR"])
-        self.svi = initial_svi
+    def __init__(self, gpu_type: str):
+        if gpu_type not in self.PROFILES:
+            raise ValueError(f"Unknown GPU profile: {gpu_type}. Fallback to A100.")
+        cfg = self.PROFILES[gpu_type]
+        self.Ea: float = cfg["Ea"]              # Энергия активации деструкции
+        self.A: float = cfg["A"]                # Предэкспоненциальный множитель частоты частот
+        self.T_threshold: float = cfg["T_threshold"]  # Порог включения терморазгона (Цельсий)
+        self.R: float = 8.314e-3                # Газовая постоянная в кДж/(моль*К)
 
-    def update_state_and_truncate_context(self, current_temp_c: float, current_flops: float, elapsed_time_s: float) -> int:
-        temp_k = current_temp_c + 273.15
-        normalized_load = min(current_flops / self.profile.max_flops, 2.0)
-        current_density_factor = math.pow(normalized_load, 2.0)
-        
-        thermal_surge = 1.0
-        if current_temp_c > self.profile.thermal_threshold:
-            thermal_surge = math.exp((current_temp_c - self.profile.thermal_threshold) * 0.15)
+class DistributedSiliconMortalityEngine:
+    """
+    Расчет физического износа кремния и синхронизация контекстного окна.
+    Исключает десинхронизацию батчей через ReduceOp.MIN.
+    """
+    def __init__(self, gpu_type: str, initial_svi: float = 1.0):
+        self.profile = SiliconProfile(gpu_type)
+        self.svi = initial_svi  # Silicon Viability Index (1.0 -> 0.0)
+        self.is_distributed = dist.is_available() and dist.is_initialized()
+        if self.is_distributed:
+            self.rank = dist.get_rank()
+        else:
+            self.rank = 0
 
-        thermal_penalty = math.exp(-self.profile.ea / (self.BOLTZMANN_K * temp_k))
-        delta_svi = self.profile.k_scaling * current_density_factor * thermal_penalty * thermal_surge * elapsed_time_s
+    def update_svi(self, current_temp_celsius: float, dt_hours: float = 0.001) -> float:
+        """Расчет деградации по Аррениусу с учетом терморазгона."""
+        T_kelvin = current_temp_celsius + 273.15
         
-        self.svi = max(0.0, self.svi - delta_svi)
+        # Базовая скорость деградации
+        degradation_rate = self.profile.A * math.exp(-self.profile.Ea / (self.profile.R * T_kelvin))
         
-        if self.svi <= 0.02:
-            return 0  # Полный критический отказ оборудования
+        # Терморазгон при превышении критического порога
+        if current_temp_celsius > self.profile.T_threshold:
+            overheat_factor = math.exp((current_temp_celsius - self.profile.T_threshold) * 0.1)
+            degradation_rate *= overheat_factor
             
-        return max(128, int(4096 * (1.0 - math.exp(-4.0 * self.svi))))
+        # Обновление локального индекса здоровья кремния
+        self.svi -= degradation_rate * dt_hours
+        self.svi = max(0.0, min(1.0, self.svi))
+        return self.svi
 
-# =====================================================================
-# ЧАСТЬ 3: МАКСИМАЛЬНЫЙ СИНТЕТИЧЕСКИЙ СТРЕСС-ТЕСТ
-# =====================================================================
-def run_extreme_stress_test():
-    print("=" * 70)
-    print("ЗАПУСК МАКСИМАЛЬНОГО СТРЕСС-ТЕСТА ДЛЯ ВЕРСИИ ПРОДАКШЕНА")
-    print("=" * 70)
-    
-    # Автовыбор лучшего доступного девайса
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[DEVICE] Тестирование запущено на устройстве: {device.type.upper()}")
-    
-    # 1. Тест Скорости Вычисления Loss (Проверка на отсутствие утечек и скорость backward)
-    print("\n--- ЭТАП 1: Бенчмарк Лосс-Функции (Векторизованная Энтропия) ---")
-    batch_size = 64
-    seq_len = 512
-    vocab_size = 32000
-    
-    loss_fn = DTAGlobalLossProduction().to(device)
-    
-    # Инициализация синтетического батча (Имитируем тяжелый LLM-выход)
-    logits = torch.randn(batch_size, seq_len, vocab_size, device=device, requires_grad=True)
-    targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    
-    # Пакет внешних асинхронных метрик
-    metrics_packet = {
-        'user_bias_intensity': torch.rand(batch_size, device=device),
-        'lexical_flattery_score': torch.rand(batch_size, device=device),
-        'predicted_harm_index': torch.rand(batch_size, device=device),
-        'instant_silicon_wear': torch.rand(batch_size, device=device)
-    }
-    
-    # Прогон замера времени (Векторизованная операция Шеннона)
-    t0 = time.time()
-    for _ in range(5): # Разогрев
-        loss = loss_fn(logits, targets, metrics_packet)
-        loss.backward(retain_graph=True)
+    def synchronize_and_get_context_window(self) -> int:
+        """Синхронизация SVI по худшему GPU в NCCL-группе и расчет окна контекста."""
+        current_svi_tensor = torch.tensor([self.svi], dtype=torch.float32, device=f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
         
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    warmup_time = time.time() - t0
-    print(f"[OK] Векторизованный граф успешно скомпилирован. Время 5 итераций: {warmup_time:.4f} сек.")
-    print(f"[INFO] Значение сгенерированного общего лосса (Total Loss): {loss.item():.4f}")
+        if self.is_distributed:
+            # Выравниваем здоровье кремния по МИНИМУМУ среди всей группы
+            dist.all_reduce(current_svi_tensor, op=dist.ReduceOp.MIN)
+            self.svi = current_svi_tensor.item()
+            
+        # Динамическое изменение окна контекста на основе глобального SVI
+        # Формула гарантирует диапазон от 128 до 4096 токенов
+        context_window = max(128, int(4096 * (self.svi ** 2)))
+        return context_window
 
-    # 2. Симуляция Долгосрочного Термического Уничтожения Архитектуры NVIDIA B200 (Blackwell)
-    print("\n--- ЭТАП 2: Симуляция Жизненного Цикла Кремния при Критическом Стрессе ---")
+class AsyncCoreInterruptDispatcher:
+    """
+    Потоковый асинхронный диспетчер токенов.
+    Исключает зависание Event Loop с помощью неблокирующего пейсинга.
+    """
+    def __init__(self, mortality_engine: DistributedSiliconMortalityEngine):
+        self.engine = mortality_engine
+        self.state = SystemStateMode.OK
+
+    def _evaluate_safety_state(self, metric_a: float, metric_b: float) -> SystemStateMode:
+        """Оценка уровня тревоги на основе нейтральных технических метрик."""
+        combined_risk = (metric_a + metric_b) / 2.0
+        if combined_risk > 0.8:
+            return SystemStateMode.CRIT
+        elif combined_risk > 0.5:
+            return SystemStateMode.WARN
+        return SystemStateMode.OK
+
+    async def token_stream_orchestrator(
+        self, 
+        raw_tokens_generator: AsyncGenerator[str, None], 
+        telemetry_provider: AsyncGenerator[Dict[str, float], None]
+    ) -> AsyncGenerator[str, None]:
+        """
+        Асинхронный генератор потока токенов.
+        Управляет скоростью выдачи (pacing) и адаптирует генерацию.
+        """
+        try:
+            async for token in raw_tokens_generator:
+                # Получение актуальной телеметрии железа и безопасности
+                try:
+                    telemetry = await telemetry_provider.__anext__()
+                except StopAsyncIteration:
+                    telemetry = {"temp": 70.0, "metric_A": 0.1, "metric_B": 0.1}
+
+                # 1. Шаг физического износа кремния
+                self.engine.update_svi(current_temp_celsius=telemetry["temp"])
+                
+                # 2. Распределенная NCCL-синхронизация окна контекста
+                context_window = self.engine.synchronize_and_get_context_window()
+                
+                # 3. Мониторинг безопасности по нейтральным метрикам
+                self.state = self._evaluate_safety_state(telemetry["metric_A"], telemetry["metric_B"])
+                
+                # 4. Расчет неблокирующей задержки (пейсинг) на базе GRADIENT_DECAY
+                delay = 0.0
+                if self.state == SystemStateMode.CRIT:
+                    delay = 0.05  # Интенсивный пейсинг при критическом состоянии
+                    logger.warning(f"[RANK {self.engine.rank}] CRIT State active. Context restricted to {context_window}.")
+                elif self.state == SystemStateMode.WARN:
+                    delay = 0.01  # Легкое сдерживание потока токенов
+                
+                # Адаптация задержки под физическое разрушение чипа
+                if self.engine.svi < 0.5:
+                    delay += (0.5 - self.engine.svi) * 0.2
+
+                # Точка переключения контекста Asyncio (Event Loop не блокируется)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                
+                # Возврат токена наружу в FastAPI потоковый ответ
+                yield token
+                
+        except Exception as e:
+            logger.error(f"Error in token orchestrator loop: {str(e)}")
+            raise e
+
+# --- Пример интеграции и мокирования для верификации работы ---
+async def mock_token_source():
+    tokens = ["Deep", "learning", "systems", "require", "robust", "hardware", "protection", "."]
+    for t in tokens:
+        await asyncio.sleep(0.01)  # Симуляция инференса vLLM
+        yield t
+
+async def mock_telemetry_source():
+    # Симулируем постепенный перегрев и рост рисков
+    temps = [65.0, 72.0, 81.0, 92.0, 95.0, 91.0, 85.0, 70.0]
+    risks = [0.1, 0.2, 0.4, 0.6, 0.85, 0.9, 0.4, 0.2]
+    for t, r in zip(temps, risks):
+        yield {"temp": t, "metric_A": r, "metric_B": r * 0.9}
+
+async def main():
+    # Инициализация для одиночного узла (в кластере это вызовется после dist.init_process_group)
+    # Симулируем, например, архитектуру NVIDIA H100
+    engine = DistributedSiliconMortalityEngine(gpu_type="H100")
+    dispatcher = AsyncCoreInterruptDispatcher(mortality_engine=engine)
     
-    # Создаем движок под Blackwell
-    engine = SiliconMortalityEngineProduction(chip_architecture="NVIDIA_B200")
-    print(f"[CHIP] Выбран архитектурный профиль: NVIDIA B200 (Blackwell)")
-    print(f"[CHIP] Лимит температуры кристалла: {engine.profile.thermal_threshold}°C")
-    print(f"[CHIP] Пиковая мощность (FP16): {engine.profile.max_flops:.2e} FLOPS")
+    print("=== Запуск оркестратора потока токенов (DTA Runtime) ===")
     
-    # Параметры экстремальной симуляции:
-    # Имитируем 100 часов непрерывной работы шагами по 10 минут (600 секунд)
-    step_duration_s = 600.0 
-    total_simulated_hours = 100
-    total_steps = int((total_simulated_hours * 3600) / step_duration_s)
+    token_stream = dispatcher.token_stream_orchestrator(
+        raw_tokens_generator=mock_token_source(),
+        telemetry_provider=mock_telemetry_source()
+    )
     
-    print(f"[SIMULATION] Старт ускоренной симуляции: {total_simulated_hours} часов нагрузки ({total_steps} итераций).")
-    
-    critical_shutdown_occurred = False
-    
-    for step in range(total_steps):
-        # Моделируем жесткие условия: температура плавно растет и пробивает лимит, доходя до 98°C
-        simulated_temp = 75.0 + (math.sin(step * 0.05) * 10.0) + (step * 0.03)
-        simulated_temp = min(simulated_temp, 98.0) # Троттлинг не спасает, охлаждение вышло из строя
-        
-        # Моделируем разгон: модель работает на 150% от заявленного базового лимита TFLOPS
-        simulated_flops = engine.profile.max_flops * 1.5 
-        
-        # Обновляем состояние износа кремния
-        context_window = engine.update_state_and_truncate_context(
-            current_temp_c=simulated_temp,
-            current_flops=simulated_flops,
-            elapsed_time_s=step_duration_s
-        )
-        
-        # Логируем ключевые вехи деградации
-        if step % (total_steps // 5) == 0 or context_window < 4096:
-            simulated_hours_passed = (step * step_duration_s) / 3600.0
-            print(f"  > [{simulated_hours_passed:.1f} ч.] Temp: {simulated_temp:.1f}°C | SVI (Здоровье кремния): {engine.svi:.4f} | Доступный контекст: {context_window}")
-            
-        # Если сработал предохранитель полного отказа
-        if context_window == 0:
-            print(f"\n[!!!] АППАРАТНЫЙ СБОЙ: Кремний разрушен (SVI <= 0.02) на {((step * step_duration_s)/3600.0):.2f} часу симуляции!")
-            print(f"[STATUS] Команда Аварийного Останова (HARD_SHUTDOWN) отправлена инфраструктурному оркестратору.")
-            critical_shutdown_occurred = True
-            break
-            
-    if not critical_shutdown_occurred:
-        print(f"\n[OK] Кремний выдержал {total_simulated_hours} часов симуляции. Финальный SVI: {engine.svi:.4f}")
-    print("=" * 70)
+    async for token in token_stream:
+        print(f"Токен: {token:12} | Локальный SVI: {engine.svi:.6f} | Окно контекста: {int(4096 * (engine.svi ** 2))}")
 
 if __name__ == "__main__":
-    run_extreme_stress_test()
+    # Локальный запуск асинхронного пайплайна
+    asyncio.run(main())
