@@ -264,21 +264,6 @@ ________________________________________
 ________________________________________
 
 ---
-
-## 💻 II. СПЕЦИФИКАЦИЯ ДЛЯ РАЗРАБОТЧИКОВ (TECHNICAL SPECIFICATION)
-
-### 1. Модификация функции вознаграждения (Reward Modeling)
-```text
-R_total = R_accuracy + α*R_density - β*R_flattery - γ*R_long_term_harm
-```
-
-### 2. Алгоритм «Мягкого Светофильтра» (The Sunrise Protocol)
-При непрерывной сессии $\Delta t > 40$ мин., система инициализирует:
-*   `FPS_DROP` — деградация динамики вывода до 5-12 Гц.
-*   `GRAYSCALE_GRADIENT` — линейное снижение сатурации матрицы на 2%/мин.
-
----
-
 ## 📑 III. СТАТУС РЕЕСТРА И ЛИЦЕНЗИЯ
 *   **Текущий статус:** `CORE REGISTRY LOCK = ENFORCED`
 *   **Идентификатор анкора:** `[CORE_MANIFEST_DTA_18.26: ANCHOR_AUTHORIZED_BY_DANNY_FATHER_IMMUTABLE]`
